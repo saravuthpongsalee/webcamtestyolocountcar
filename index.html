@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>AI Car Counter - ID Tracking v4.0</title>
+  
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+  
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 10px; background: #121212; color: #fff; margin: 0; }
+    .container { position: relative; width: 100%; max-width: 500px; margin: 0 auto; }
+    video { display: none; } 
+    canvas { width: 100% !important; height: auto !important; border-radius: 12px; box-shadow: 0 8px 30px rgba(0,0,0,0.7); background-color: #000; }
+       
+    .counter-dashboard { display: flex; justify-content: space-around; max-width: 470px; margin: 10px auto; background: #222; padding: 15px; border-radius: 12px; border: 1px solid #333; }
+    .counter-item { text-align: center; }
+    .counter-item h3 { margin: 0 0 5px 0; font-size: 14px; color: #aaa; }
+    .counter-item p { margin: 0; font-size: 32px; font-weight: bold; color: #00ff00; font-family: monospace; }
+    
+    .control-panel { background: #1e1e1e; padding: 15px; border-radius: 12px; border: 1px solid #333; max-width: 470px; margin: 0 auto; }
+    .btn-group { display: flex; gap: 8px; justify-content: center; flex-wrap: wrap; margin-bottom: 12px; }
+    .btn { background: #007bff; color: #fff; border: none; padding: 12px 18px; font-size: 14px; border-radius: 8px; cursor: pointer; font-weight: bold; }
+    .btn-success { background: #28a745; }
+    .btn-danger { background: #dc3545; }
+    
+    #cameraSelectContainer { margin-top: 10px; display: none; }
+    select { background: #333; color: #fff; border: 1px solid #555; padding: 10px; border-radius: 6px; font-size: 14px; width: 100%; max-width: 300px; }
+    
+    .debug-box { max-width: 430px; margin: 15px auto 0 auto; background: #131313; border: 1px solid #333; border-radius: 8px; padding: 12px; text-align: left; font-size: 12px; font-family: monospace; color: #00ff00; line-height: 1.6; }
+    #status { margin-top: 10px; font-size: 14px; color: #999; }
+  </style>
+</head>
+<body>
+
+  <h2>AI Vehicle Counter Pro</h2>
+  
+  <div class="container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas" width="640" height="480"></canvas>
+  </div>
+
+  <div class="counter-dashboard">
+    <div class="counter-item">
+      <h3>🚗 จำนวนรถที่นับได้ (TOTAL)</h3>
+      <p id="carCountDisplay">0</p>
+    </div>
+    <div class="counter-item">
+      <h3>🆔 กำลังติดตามในจอ</h3>
+      <p id="trackedObjectsDisplay" style="color: #ffcc00;">0</p>
+    </div>
+  </div>
+
+  <div class="control-panel">
+    <div class="btn-group">
+      <button id="switchBtn" class="btn" style="background:#6c757d;" onclick="switchCameraMobile()">🔄 สลับกล้อง หน้า/หลัง</button>
+      <button class="btn btn-success" onclick="captureAndSend()">📸 ส่งภาพหลักฐานไป Google</button>
+      <button class="btn btn-danger" onclick="resetCounter()">🧹 รีเซ็ตตัวนับ</button>
+    </div>
+    
+    <div id="cameraSelectContainer">
+      <select id="videoSource" onchange="startCamera()"></select>
+    </div>
+  </div>
+  
+  <p id="status">กำลังเตรียม AI เอนจิ้น...</p>
+
+  <div class="debug-box">
+    <div style="text-align:center; font-weight:bold; color:#ffcc00; margin-bottom:5px;">🛠️ TRACKING DIAGNOSTICS</div>
+    <div>DEVICE MODE   : <span id="devType" style="color:#fff;">-</span></div>
+    <div>ACTIVE CAMERA : <span id="devCam" style="color:#fff;">-</span></div>
+    <div>TARGET CLASS  : <span style="color:#fff;">car, motorcycle, truck, bus</span></div>
+    <div>COUNTED IDs   : <span id="countedIdsList" style="color:#fff;">[]</span></div>
+  </div>
+
+  <script>
+    const GOOGLE_SCRIPT_URL = "https://script.google.com/macros/s/ใส่googleของคุณเอง/exec";
+
+    let video = document.getElementById('video');
+    let canvas = document.getElementById('canvas');
+    let ctx = canvas.getContext('2d');
+    let videoSelect = document.getElementById('videoSource');
+    let cameraSelectContainer = document.getElementById('cameraSelectContainer');
+    let switchBtn = document.getElementById('switchBtn');
+    let statusElement = document.getElementById('status');
+    
+    let streamRef = null;
+    let modelSession = null;
+    let currentFacingMode = "environment"; 
+    let isMobile = false;
+    
+    let totalCarCount = 0;
+    let nextObjectID = 1;
+    let trackedObjects = []; 
+    let countedIDs = new Set();
+     
+    const COUNTING_LINE_Y = 240; 
+    const allowedClasses = ['car', 'motorcycle', 'truck', 'bus'];
+
+    function checkDevice() {
+      const ua = navigator.userAgent;
+      if (/Android|iPhone|iPad|iPod/i.test(ua)) {
+        isMobile = true;
+        document.getElementById('devType').innerText = "📱 MOBILE";
+        cameraSelectContainer.style.display = "none";
+        switchBtn.style.display = "inline-block";
+      } else {
+        isMobile = false;
+        document.getElementById('devType').innerText = "💻 COMPUTER";
+        cameraSelectContainer.style.display = "block";
+        switchBtn.style.display = "none";
+      }
+    }
+
+    function getCameras() {
+      if (isMobile) return;
+      navigator.mediaDevices.enumerateDevices().then(devices => {
+        videoSelect.innerHTML = '';
+        devices.forEach(device => {
+          if (device.kind === 'videoinput') {
+            const option = document.createElement('option');
+            option.value = device.deviceId;
+            option.text = device.label || `Camera ${videoSelect.length + 1}`;
+            videoSelect.appendChild(option);
+          }
+        });
+      });
+    }
+
+    async function initAI() {
+      statusElement.innerText = "กำลังดาวน์โหลดโมเดลนับรถ AI...";
+      try {
+        await tf.ready();
+        modelSession = await cocoSsd.load({ base: 'mobilenet_v2' });
+        statusElement.innerText = "ระบบนับรถพร้อมทำงาน!";
+        statusElement.style.color = "#28a745";
+        
+        await startCamera();
+        runInference(); 
+        renderLoop();   
+      } catch (e) {
+        statusElement.innerText = "โหลดระบบล้มเหลว: " + e.message;
+        startCamera();
+        renderLoop();
+      }
+    }
+
+    async function startCamera() {
+      if (streamRef) {
+        streamRef.getTracks().forEach(track => track.stop());
+        streamRef = null;
+        video.srcObject = null;
+      }
+
+      let constraints = { audio: false };
+      if (isMobile) {
+        constraints.video = { facingMode: currentFacingMode, width: 640, height: 480 };
+        document.getElementById('devCam').innerText = currentFacingMode === "user" ? "FRONT (หน้า)" : "BACK (หลัง)";
+      } else {
+        const videoSource = videoSelect.value;
+        constraints.video = { deviceId: videoSource ? { exact: videoSource } : undefined, width: 640, height: 480 };
+        if(videoSelect.options.length > 0) {
+          document.getElementById('devCam').innerText = videoSelect.options[videoSelect.selectedIndex].text;
+        }
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        streamRef = stream;
+        video.srcObject = stream;
+        await video.play();
+      } catch (err) {
+        statusElement.innerText = "กล้องเออร์เรอร์: " + err.message;
+      }
+    }
+
+    function switchCameraMobile() {
+      if (!isMobile) return;
+      currentFacingMode = (currentFacingMode === "user") ? "environment" : "user";
+      startCamera();
+    }
+
+     async function runInference() {
+      if (modelSession && video.readyState === video.HAVE_ENOUGH_DATA) {
+        try {
+          const rawPredictions = await modelSession.detect(video);
+      
+          let currentVehicles = rawPredictions.filter(p => allowedClasses.includes(p.class) && p.score > 0.35);
+     
+          let newTrackedObjects = [];
+
+          for (let p of currentVehicles) {
+            let [x, y, w, h] = p.bbox;
+            let centerX = x + w / 2;
+            let centerY = y + h / 2;
+            
+            let matchedID = null;
+            let minDistance = 60; 
+
+            for (let oldObj of trackedObjects) {
+              let dist = Math.hypot(centerX - oldObj.lastX, centerY - oldObj.lastY);
+              if (dist < minDistance) {
+                minDistance = dist;
+                matchedID = oldObj.id;
+              }
+            }
+           
+            if (matchedID === null) {
+              matchedID = nextObjectID++;
+            }
+
+            const isMirror = (isMobile && currentFacingMode === "user") || !isMobile;
+            let drawX = x;
+            if (isMirror) { drawX = canvas.width - x - w; }
+
+            let hasCrossed = countedIDs.has(matchedID);
+            let oldRecord = trackedObjects.find(o => o.id === matchedID);
+            if (oldRecord && !hasCrossed) {
+                  if ((oldRecord.lastY <= COUNTING_LINE_Y && centerY > COUNTING_LINE_Y) ||
+                  (oldRecord.lastY >= COUNTING_LINE_Y && centerY < COUNTING_LINE_Y)) {
+               
+                totalCarCount++; 
+                countedIDs.add(matchedID); 
+                hasCrossed = true;
+            
+          
+                statusElement.innerText = `🚨 ตรวจพบ ${p.class} ID: ${matchedID} วิ่งผ่านเส้น!`;
+                statusElement.style.color = "#ffcc00";
+              }
+            }
+
+            newTrackedObjects.push({
+              id: matchedID,
+              lastX: centerX,
+              lastY: centerY,
+              drawX: drawX,
+              drawY: y,
+              w: w,
+              h: h,
+              label: p.class,
+              score: p.score
+            });
+          }
+
+         
+          trackedObjects = newTrackedObjects;
+          
+        
+          document.getElementById('carCountDisplay').innerText = totalCarCount;
+          document.getElementById('trackedObjectsDisplay').innerText = trackedObjects.length;
+          document.getElementById('countedIdsList').innerText = JSON.stringify(Array.from(countedIDs));
+
+        } catch (err) {
+          console.error(err);
+        }
+      }
+      setTimeout(runInference, 50); 
+    }
+
+    function renderLoop() {
+      if (video.readyState === video.HAVE_ENOUGH_DATA) {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        const isMirror = (isMobile && currentFacingMode === "user") || !isMobile;
+
+          if (isMirror) {
+          ctx.save();
+          ctx.translate(canvas.width, 0);
+          ctx.scale(-1, 1);
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+          ctx.restore();
+        } else {
+          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        }
+        
+        ctx.strokeStyle = countedIDs.size > 0 ? "#ff3333" : "#ff0000";
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.moveTo(0, COUNTING_LINE_Y);
+        ctx.lineTo(canvas.width, COUNTING_LINE_Y);
+        ctx.stroke();
+        
+        ctx.fillStyle = "#ff0000";
+        ctx.font = "bold 13px sans-serif";
+        ctx.fillText("🛑 เส้นตรวจจับการนับรถ (COUNTING LINE)", 15, COUNTING_LINE_Y - 8);
+        
+        for (let obj of trackedObjects) {
+          let isPassed = countedIDs.has(obj.id);
+                    
+          ctx.strokeStyle = isPassed ? "#ff9900" : "#00ff00";
+          ctx.lineWidth = 3;
+          ctx.strokeRect(obj.drawX, obj.drawY, obj.w, obj.h);
+          
+          ctx.fillStyle = isPassed ? "#ff9900" : "#00ff00";
+          let speedText = Math.round(obj.score * 100) + "%";
+          let labelText = `ID: ${obj.id} [${obj.label}] ${speedText}`;
+          ctx.fillRect(obj.drawX, obj.drawY - 25, labelText.length * 9 + 10, 25);
+
+          ctx.fillStyle = "#000000";
+          ctx.font = "bold 14px monospace";
+          ctx.fillText(labelText, obj.drawX + 5, obj.drawY - 7);
+          
+          ctx.fillStyle = "#ffffff";
+          let dotX = obj.drawX + obj.w/2;
+          ctx.beginPath();
+          ctx.arc(dotX, obj.drawY + obj.h/2, 5, 0, 2 * Math.PI);
+          ctx.fill();
+        }
+      }
+      requestAnimationFrame(renderLoop);
+    }
+
+    function resetCounter() {
+      totalCarCount = 0;
+      nextObjectID = 1;
+      trackedObjects = [];
+      countedIDs.clear();
+      document.getElementById('carCountDisplay').innerText = "0";
+      document.getElementById('countedIdsList').innerText = "[]";
+      statusElement.innerText = "ล้างข้อมูลระบบตัวนับใหม่เรียบร้อย";
+      statusElement.style.color = "#aaa";
+    }
+
+    function captureAndSend() {
+      statusElement.innerText = "กำลังอัปโหลดหลักฐานพร้อมตัวเลขนับเข้า Google Drive...";
+      statusElement.style.color = "#007bff";
+      
+      const base64Image = canvas.toDataURL('image/jpeg', 0.85);
+      const formBody = 'image=' + encodeURIComponent(base64Image);
+
+      fetch(GOOGLE_SCRIPT_URL, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: formBody
+      })
+      .then(() => {
+        statusElement.innerText = `📸 สำเร็จ! ภาพนับรถหลักฐาน (ยอดรวมปัจจุบัน: ${totalCarCount} คัน) บันทึกลงไดรฟ์แล้ว`;
+        statusElement.style.color = "#28a745";
+      })
+      .catch(err => {
+        statusElement.innerText = "ส่งข้อมูลล้มเหลว: " + err.message;
+        statusElement.style.color = "#dc3545";
+      });
+    }
+
+    window.onload = async function() {
+      checkDevice();
+      try {
+        const initStream = await navigator.mediaDevices.getUserMedia({video: true});
+        initStream.getTracks().forEach(track => track.stop());
+        getCameras();
+        initAI(); 
+      } catch(e) {
+        initAI();
+      }
+    }
+  </script>
+</body>
+</html>
